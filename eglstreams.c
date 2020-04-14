@@ -247,9 +247,10 @@ static uint32_t drm_encoder_find_crtc(
 	drmModeEncoder const * __restrict const encoder,
 	uint32_t * __restrict const crtc_index)
 {
+	LOGF("Find encoder CRTC");
 	/* 0 for "no CRTC found" */
 	uint32_t selected_crtc = NO_CRTC_FOUND;
-	uint32_t const n_crtcs;
+	uint32_t const n_crtcs = resources->count_crtcs;
 	for (uint32_t i = 0;
 	     (selected_crtc == NO_CRTC_FOUND) & (i < n_crtcs);
 	     i++)
@@ -258,7 +259,14 @@ static uint32_t drm_encoder_find_crtc(
 		 * https://dvdhrm.wordpress.com/2012/09/13/linux-drm-mode-setting-api
 		 */
 		uint32_t const crtc_mask = 1 << i;
-		if (encoder->possible_crtcs & crtc_mask) {
+		uint32_t const possible_crtcs =
+			encoder->possible_crtcs;
+		LOGF(
+			"CRTCS : %08x\n"
+			"MASK  : %08x\n",
+			crtc_mask,
+			possible_crtcs);
+		if (possible_crtcs & crtc_mask) {
 			selected_crtc = resources->crtcs[i];
 			*crtc_index = i;
 		}
@@ -277,8 +285,8 @@ static uint32_t drm_connector_find_crtc(
 
 	uint32_t const n_encoders =
 		connector->count_encoders;
-	for (int i = 0;
-	     (crtc_id != NO_CRTC_FOUND) & (i < n_encoders);
+	for (uint32_t i = 0;
+	     (crtc_id == NO_CRTC_FOUND) & (i < n_encoders);
 	     i++)
 	{
 		uint32_t const encoder_id = connector->encoders[i];
@@ -475,7 +483,7 @@ static uint64_t drm_get_property(
 		drmModeObjectGetProperties(drm_fd, object_id, object_type);
 	uint32_t const n_props = object_properties->count_props;
 
-	for (uint32_t i = 0; (found != 0) & (i < n_props); i++) {
+	for (uint32_t i = 0; (found == 0) & (i < n_props); i++) {
 
 		drmModePropertyRes * __restrict const prop =
 			drmModeGetProperty(drm_fd, object_properties->props[i]);
@@ -521,7 +529,7 @@ static uint32_t drm_get_primary_plane_for_crtc(
 		uint32_t const n_planes = planes_resources->count_planes;
 
 		for (uint32_t i = 0;
-			(plane_id != NO_PLANE_FOUND) & (i < n_planes);
+			(plane_id == NO_PLANE_FOUND) & (i < n_planes);
 			i++)
 		{
 			uint32_t const plane_i =
