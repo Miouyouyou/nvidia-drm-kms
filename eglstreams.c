@@ -58,6 +58,8 @@
 
 #define LOGVF(fmt, ...) fprintf(stdout, fmt "\n", ##__VA_ARGS__)
 
+#define LOG_ERROR(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+
 static struct {
 	EGLDisplay display;
 	EGLConfig config;
@@ -69,12 +71,14 @@ static struct {
 	GLuint positionsoffset, colorsoffset, normalsoffset;
 } gl;
 
-static struct {
+struct myy_drm_infos {
 	int fd;
-	drmModeModeInfo *mode;
+	drmModeModeInfo * mode;
 	uint32_t crtc_id;
+	uint32_t plane_id;
 	uint32_t connector_id;
-} drm;
+};
+typedef struct myy_drm_infos myy_drm_infos_t;
 
 struct drm_fb {
 	uint32_t fb_id;
@@ -176,47 +180,247 @@ int egl_strstr(
 	return ret;
 }
 
+static void egl_print_config_attribs(
+	EGLDisplay egl_display,
+	EGLConfig const config)
+{
+	EGLint value;
+	eglGetConfigAttrib(egl_display, config, EGL_ALPHA_SIZE, &value);
+	LOGF("\tEGL_ALPHA_SIZE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_BIND_TO_TEXTURE_RGB, &value);
+	LOGF("\tEGL_BIND_TO_TEXTURE_RGB : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_BIND_TO_TEXTURE_RGBA, &value);
+	LOGF("\tEGL_BIND_TO_TEXTURE_RGBA : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_BLUE_SIZE, &value);
+	LOGF("\tEGL_BLUE_SIZE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_BUFFER_SIZE, &value);
+	LOGF("\tEGL_BUFFER_SIZE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_CONFIG_CAVEAT, &value);
+	LOGF("\tEGL_CONFIG_CAVEAT : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_CONFIG_ID, &value);
+	LOGF("\tEGL_CONFIG_ID : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_DEPTH_SIZE, &value);
+	LOGF("\tEGL_DEPTH_SIZE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_GREEN_SIZE, &value);
+	LOGF("\tEGL_GREEN_SIZE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_LEVEL, &value);
+	LOGF("\tEGL_LEVEL : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_MAX_PBUFFER_WIDTH, &value);
+	LOGF("\tEGL_MAX_PBUFFER_WIDTH : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_MAX_PBUFFER_HEIGHT, &value);
+	LOGF("\tEGL_MAX_PBUFFER_HEIGHT : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_MAX_PBUFFER_PIXELS, &value);
+	LOGF("\tEGL_MAX_PBUFFER_PIXELS : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_MAX_SWAP_INTERVAL, &value);
+	LOGF("\tEGL_MAX_SWAP_INTERVAL : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_MIN_SWAP_INTERVAL, &value);
+	LOGF("\tEGL_MIN_SWAP_INTERVAL : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_NATIVE_RENDERABLE, &value);
+	LOGF("\tEGL_NATIVE_RENDERABLE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_NATIVE_VISUAL_ID, &value);
+	LOGF("\tEGL_NATIVE_VISUAL_ID : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_NATIVE_VISUAL_TYPE, &value);
+	LOGF("\tEGL_NATIVE_VISUAL_TYPE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_RED_SIZE, &value);
+	LOGF("\tEGL_RED_SIZE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_SAMPLE_BUFFERS, &value);
+	LOGF("\tEGL_SAMPLE_BUFFERS : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_SAMPLES, &value);
+	LOGF("\tEGL_SAMPLES : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_STENCIL_SIZE, &value);
+	LOGF("\tEGL_STENCIL_SIZE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_SURFACE_TYPE, &value);
+	LOGF("\tEGL_SURFACE_TYPE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_TRANSPARENT_TYPE, &value);
+	LOGF("\tEGL_TRANSPARENT_TYPE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_TRANSPARENT_RED_VALUE, &value);
+	LOGF("\tEGL_TRANSPARENT_RED_VALUE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_TRANSPARENT_GREEN_VALUE, &value);
+	LOGF("\tEGL_TRANSPARENT_GREEN_VALUE : %d", value);
+	eglGetConfigAttrib(egl_display, config, EGL_TRANSPARENT_BLUE_VALUE, &value);
+	LOGF("\tEGL_TRANSPARENT_BLUE_VALUE : %d", value);
+}
 
-static uint32_t find_crtc_for_encoder(const drmModeRes *resources,
-				      const drmModeEncoder *encoder) {
-	int i;
-
-	for (i = 0; i < resources->count_crtcs; i++) {
+#define NO_CRTC_FOUND (0)
+static uint32_t drm_encoder_find_crtc(
+	drmModeRes const * __restrict const resources,
+	drmModeEncoder const * __restrict const encoder,
+	uint32_t * __restrict const crtc_index)
+{
+	/* 0 for "no CRTC found" */
+	uint32_t selected_crtc = NO_CRTC_FOUND;
+	uint32_t const n_crtcs;
+	for (uint32_t i = 0;
+	     (selected_crtc == NO_CRTC_FOUND) & (i < n_crtcs);
+	     i++)
+	{
 		/* possible_crtcs is a bitmask as described here:
 		 * https://dvdhrm.wordpress.com/2012/09/13/linux-drm-mode-setting-api
 		 */
-		const uint32_t crtc_mask = 1 << i;
-		const uint32_t crtc_id = resources->crtcs[i];
+		uint32_t const crtc_mask = 1 << i;
 		if (encoder->possible_crtcs & crtc_mask) {
-			return crtc_id;
+			selected_crtc = resources->crtcs[i];
+			*crtc_index = i;
 		}
 	}
 
-	/* no match found */
-	return -1;
+	return selected_crtc;
 }
 
-static uint32_t find_crtc_for_connector(const drmModeRes *resources,
-					const drmModeConnector *connector) {
-	int i;
+static uint32_t drm_connector_find_crtc(
+	drmModeRes const * __restrict const resources,
+	drmModeConnector const * __restrict const connector,
+	uint32_t * __restrict const crtc_index,
+	int const drm_fd)
+{
+	uint32_t crtc_id = NO_CRTC_FOUND;
 
-	for (i = 0; i < connector->count_encoders; i++) {
-		const uint32_t encoder_id = connector->encoders[i];
-		drmModeEncoder *encoder = drmModeGetEncoder(drm.fd, encoder_id);
+	uint32_t const n_encoders =
+		connector->count_encoders;
+	for (int i = 0;
+	     (crtc_id != NO_CRTC_FOUND) & (i < n_encoders);
+	     i++)
+	{
+		uint32_t const encoder_id = connector->encoders[i];
+		drmModeEncoder * __restrict const encoder =
+			drmModeGetEncoder(drm_fd, encoder_id);
 
 		if (encoder) {
-			const uint32_t crtc_id = find_crtc_for_encoder(resources, encoder);
+			crtc_id = drm_encoder_find_crtc(
+				resources, encoder, crtc_index);
 
 			drmModeFreeEncoder(encoder);
-			if (crtc_id != 0) {
-				return crtc_id;
-			}
+		}
+		else {
+			LOGF("... We asked for the encoders, "
+				"got a NULL pointer instead");
 		}
 	}
 
-	/* no match found */
-	return -1;
+	return crtc_id;
 }
+
+static void drm_mode_display_infos(
+	drmModeModeInfo const * __restrict const mode)
+{
+	LOGF("[DRM Mode Info] {\n"
+		"\tuint32_t clock       = %u;\n"
+		"\tuint16_t hdisplay    = %u;\n"
+		"\tuint16_t hsync_start = %u;\n"
+		"\tuint16_t hsync_end   = %u;\n"
+		"\tuint16_t htotal      = %u;\n"
+		"\tuint16_t hskew       = %u;\n"
+		"\tuint16_t vdisplay    = %u;\n"
+		"\tuint16_t vsync_start = %u;\n"
+		"\tuint16_t vsync_end   = %u;\n"
+		"\tuint16_t vtotal      = %u;\n"
+		"\tuint16_t vscan       = %u;\n"
+		"\tuint32_t vrefresh    = %u;\n"
+		"\tuint32_t flags       = %u;\n"
+		"\tuint32_t type        = %u;\n"
+		"\tchar     name[32]    = %s;\n"
+		"};",
+		mode->clock      ,
+		mode->hdisplay   ,
+		mode->hsync_start,
+		mode->hsync_end  ,
+		mode->htotal     ,
+		mode->hskew      ,
+		mode->vdisplay   ,
+		mode->vsync_start,
+		mode->vsync_end  ,
+		mode->vtotal     ,
+		mode->vscan      ,
+		mode->vrefresh   ,
+		mode->flags      ,
+		mode->type       ,
+		mode->name ? mode->name : "(null)");
+}
+
+static bool drm_connector_seems_valid(
+	drmModeConnector * __restrict const connector)
+{
+	return
+		((connector->connection == DRM_MODE_CONNECTED)
+		& (connector->count_modes > 0)
+		& (connector->count_encoders > 0));
+}
+
+static drmModeConnector * drm_get_connector(
+	int const drm_fd,
+	drmModeRes * __restrict const resources)
+{
+	drmModeConnector * __restrict connector = NULL;
+	/* find a connected connector: */
+	uint32_t const n_connectors =
+		resources->count_connectors;
+	for (uint32_t i = 0; i < n_connectors; i++) {
+		connector = drmModeGetConnector(
+			drm_fd, resources->connectors[i]);
+		if (drm_connector_seems_valid(connector)) {
+			break;
+		}
+		else {
+			drmModeFreeConnector(connector);
+		    connector = NULL;
+		}
+	}
+
+	if (!connector) {
+		/* we could be fancy and listen for hotplug events and wait for
+		 * a connector..
+		 */
+		LOG_ERROR("No connected screens ?\n");
+	}
+
+    return connector;
+}
+
+static drmModeModeInfo * drm_connect_select_best_resolution(
+	drmModeConnector * __restrict const connector)
+{
+	int preferred_mode_index = -1;
+	int highest_res_mode_index = -1;
+	drmModeModeInfo * the_chosen_one;
+
+	/* find prefered mode or the highest resolution mode: */
+	for (int i = 0, biggest_area = 0; i < connector->count_modes; i++) {
+		drmModeModeInfo const * __restrict const current_mode =
+			connector->modes+i;
+
+		drm_mode_display_infos(current_mode);
+
+		if (current_mode->type & DRM_MODE_TYPE_PREFERRED) {
+			preferred_mode_index = i;
+		}
+
+		int const current_area =
+			current_mode->hdisplay * current_mode->vdisplay;
+		if (current_area > biggest_area) {
+			highest_res_mode_index = i;
+			biggest_area = current_area;
+		}
+
+	}
+
+	if (preferred_mode_index >= 0) {
+		the_chosen_one = 
+			connector->modes+preferred_mode_index;
+	}
+	else if (highest_res_mode_index >= 0) {
+		the_chosen_one =
+			connector->modes+highest_res_mode_index;
+	}
+	else {
+		LOG_ERROR(
+			"Wow, a screen with zero resolution available !\n"
+			"Now, THAT'S useful !");
+		the_chosen_one = NULL;
+	}
+
+	return the_chosen_one;
+}
+	
 
 static int myy_drm_set_caps(
 	int const drm_fd,
@@ -240,14 +444,134 @@ static int myy_drm_set_caps(
 	return ret;
 }
 
+static uint32_t drm_get_best_crtc(
+	int const drm_fd,
+	drmModeRes * __restrict const resources,
+	drmModeConnector * __restrict const connector,
+	uint32_t * __restrict const crtc_index)
+{
 
+	/* In order to get a valid "Primary plane ID",
+	 * which will be used by the NVIDIA EGL Extension
+	 * later, we need to get index of the CRTC used
+	 * selected.
+	 * So no shortcuts.
+	 */
+	return drm_connector_find_crtc(
+		resources, connector, crtc_index, drm_fd);
+}
+
+static uint64_t drm_get_property(
+	int const drm_fd,
+	uint32_t const object_id,
+	uint32_t const object_type,
+	char const * __restrict const property_name,
+	int * __restrict const prop_found)
+{
+	uint64_t value = 0;
+	int found = 0;
+
+	drmModeObjectProperties * __restrict const object_properties =
+		drmModeObjectGetProperties(drm_fd, object_id, object_type);
+	uint32_t const n_props = object_properties->count_props;
+
+	for (uint32_t i = 0; (found != 0) & (i < n_props); i++) {
+
+		drmModePropertyRes * __restrict const prop =
+			drmModeGetProperty(drm_fd, object_properties->props[i]);
+
+		if (prop == NULL) {
+			LOGF("[DRM Property] "
+				"Property %d on %d led to a NULL Pointer !\n",
+				i, n_props);
+			break;
+		}
+
+		if (strcmp(property_name, prop->name) == 0) {
+			value = object_properties->prop_values[i];
+			found = 1;
+		}
+
+		drmModeFreeProperty(prop);
+	}
+
+	drmModeFreeObjectProperties(object_properties);
+
+	if (!found) {
+		LOGF("[DRM Property] "
+			"Property \"%s\" not found...\n",
+			property_name);
+	}
+
+	*prop_found = found;
+	return value;
+}
+
+#define NO_PLANE_FOUND (0)
+static uint32_t drm_get_primary_plane_for_crtc(
+	int drm_fd,
+	uint32_t const selected_crtc_index)
+{
+	uint32_t plane_id = NO_PLANE_FOUND;
+	uint32_t n_planes = 0;
+	drmModePlaneRes * __restrict const planes_resources =
+		drmModeGetPlaneResources(drm_fd);
+
+	if (planes_resources != NULL) {
+		uint32_t const n_planes = planes_resources->count_planes;
+
+		for (uint32_t i = 0;
+			(plane_id != NO_PLANE_FOUND) & (i < n_planes);
+			i++)
+		{
+			uint32_t const plane_i =
+				planes_resources->planes[i];
+			drmModePlane * __restrict const plane =
+				drmModeGetPlane(drm_fd, plane_i);
+
+			if (plane == NULL) {
+				LOGF("Plane %d leads to a NULL pointer ! WHAT !!?\n",
+					i);
+				break;
+			}
+
+			uint32_t const crtcs = plane->possible_crtcs;
+			drmModeFreePlane(plane);
+
+			if ((crtcs & (1 << selected_crtc_index)) == 0) {
+				/* This is not the plane you're looking for */
+				continue;
+			}
+
+			int property_found = 0;
+			uint64_t const type = drm_get_property(
+				drm_fd,
+				plane_i,
+				DRM_MODE_OBJECT_PLANE,
+				"type",
+				&property_found);
+			if ((property_found) & (type == DRM_PLANE_TYPE_PRIMARY))
+			{
+				plane_id = plane_i;
+			}
+		}
+
+		drmModeFreePlaneResources(planes_resources);
+	}
+	else {
+		LOGF("No planes resources for this DRM node ??\n");
+	}
+
+	return plane_id;
+}
 
 static int init_drm(
-	char const * __restrict const drm_device_file)
+	char const * __restrict const drm_device_file,
+	myy_drm_infos_t * __restrict const myy_drm_conf)
 {
 	drmModeRes *resources;
 	drmModeConnector *connector = NULL;
-	drmModeEncoder *encoder = NULL;
+	drmModeModeInfo * mode = NULL;
 	struct myy_drm_caps const requested_caps[] = {
 		{
 			"DRM_CLIENT_CAP_UNIVERSAL_PLANES", DRM_CLIENT_CAP_UNIVERSAL_PLANES,
@@ -263,102 +587,91 @@ static int init_drm(
 		}
 	};
 	int i, area;
+	int drm_fd = -1;
+	int ret = -1;
+	uint32_t crtc_index = 0;
+	uint32_t crtc_id = NO_CRTC_FOUND;
+	uint32_t plane_id = 0;
 
-	drm.fd = open(drm_device_file, O_RDWR);
+	drm_fd = open(drm_device_file, O_RDWR);
 	
-	if (drm.fd < 0) {
-		LOGF("could not open drm device\n");
-		return -1;
-	}
-	else {
-		LOGVF("Opened %s successfully\n", drm_device_file);
+	if (drm_fd < 0) {
+		LOGF("Could not open drm device\n");
+		goto no_drm_device;
 	}
 
-	if (myy_drm_set_caps(drm.fd, requested_caps) < 0)
+	LOGVF("Opened %s successfully\n", drm_device_file);
+
+	ret = myy_drm_set_caps(drm_fd, requested_caps);
+	if (ret == -1)
 	{
 		LOGF("The device doesn't have the right capabilities");
-		return -1;
+		goto required_caps_not_available;
 	}
 
-	resources = drmModeGetResources(drm.fd);
+	resources = drmModeGetResources(drm_fd);
 	if (!resources) {
 		printf("drmModeGetResources failed: %s\n", strerror(errno));
-		return -1;
+		goto no_drm_resources;
 	}
 
-	/* find a connected connector: */
-	for (i = 0; i < resources->count_connectors; i++) {
-		connector = drmModeGetConnector(drm.fd, resources->connectors[i]);
-		if (connector->connection == DRM_MODE_CONNECTED) {
-			/* it's connected, let's use this! */
-			break;
-		}
-		drmModeFreeConnector(connector);
-		connector = NULL;
+	connector = drm_get_connector(drm_fd, resources);
+	if (connector == NULL) {
+		LOGF("No DRM connector...");
+		goto no_drm_connector;
 	}
 
-	if (!connector) {
-		/* we could be fancy and listen for hotplug events and wait for
-		 * a connector..
-		 */
-		printf("no connected connector!\n");
-		return -1;
+	mode = drm_connect_select_best_resolution(connector);
+	if (mode == NULL) {
+		LOGF("No available resolutions...");
+		goto no_drm_modes_useable;
 	}
 
-	/* find prefered mode or the highest resolution mode: */
-	for (i = 0, area = 0; i < connector->count_modes; i++) {
-		drmModeModeInfo *current_mode = &connector->modes[i];
-
-		if (current_mode->type & DRM_MODE_TYPE_PREFERRED) {
-			drm.mode = current_mode;
-		}
-
-		int current_area = current_mode->hdisplay * current_mode->vdisplay;
-		if (current_area > area) {
-			drm.mode = current_mode;
-			area = current_area;
-		}
+	crtc_id = drm_get_best_crtc(
+		drm_fd, resources, connector, &crtc_index);
+	if (crtc_id == NO_CRTC_FOUND) {
+		LOGF("No CRTC useable with the selected connector...");
+		goto no_drm_crtc_available;
 	}
 
-	if (!drm.mode) {
-		printf("could not find mode!\n");
-		return -1;
+	plane_id = drm_get_primary_plane_for_crtc(drm_fd, crtc_index);
+	if (plane_id == NO_PLANE_FOUND) {
+		LOGF("No primary plane found !?");
+		goto no_drm_primary_plane;
 	}
 
-	/* find encoder: */
-	for (i = 0; i < resources->count_encoders; i++) {
-		encoder = drmModeGetEncoder(drm.fd, resources->encoders[i]);
-		if (encoder->encoder_id == connector->encoder_id)
-			break;
-		drmModeFreeEncoder(encoder);
-		encoder = NULL;
-	}
-
-	if (encoder) {
-		drm.crtc_id = encoder->crtc_id;
-	} else {
-		uint32_t crtc_id = find_crtc_for_connector(resources, connector);
-		if (crtc_id == 0) {
-			printf("no crtc found!\n");
-			return -1;
-		}
-
-		drm.crtc_id = crtc_id;
-	}
-
-	drm.connector_id = connector->connector_id;
+	myy_drm_conf->fd           = drm_fd;
+	myy_drm_conf->mode         = mode;
+	myy_drm_conf->crtc_id      = crtc_id;
+	myy_drm_conf->plane_id     = plane_id;
+	myy_drm_conf->connector_id = connector->connector_id;
 
 	return 0;
+
+no_drm_primary_plane:
+no_drm_crtc_available:
+no_drm_modes_useable:
+	drmModeFreeConnector(connector);
+no_drm_connector:
+	drmModeFreeResources(resources);
+no_drm_resources:
+required_caps_not_available:
+	close(drm_fd);
+no_drm_device:
+	return -1;
 }
 
 static int nvidia_drm_open(
 	struct myy_nvidia_functions const * __restrict const myy_nvidia,
-	EGLDeviceEXT egl_device)
+	EGLDeviceEXT egl_device,
+	myy_drm_infos_t * __restrict const myy_drm_conf)
 {
 	char const * __restrict const drm_device_filepath =
 		myy_nvidia->eglQueryDeviceString(
 			egl_device, EGL_DRM_DEVICE_FILE_EXT);
 
+	LOGF("[NVIDIA] drm_device_filepath : %s\n",
+		drm_device_filepath);
 	int ret = 0;
 
 	/* TODO This check should be performed while checking
@@ -370,80 +683,147 @@ static int nvidia_drm_open(
 		ret = -1;
 	}
 
-	ret = init_drm(drm_device_filepath);
+	ret = init_drm(drm_device_filepath, myy_drm_conf);
 	return ret;
 }
 
-/*static int init_gl(void)
+
+
+static EGLBoolean egl_nvidia_get_config(
+	EGLDisplay const egl_display,
+	EGLConfig * __restrict const egl_config)
+{
+	/* The desired minimal configuration */
+	static const EGLint config_attribs[] = {
+		EGL_SURFACE_TYPE, EGL_STREAM_BIT_KHR, // Important one
+		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, // We want GLES 2.x
+		EGL_RED_SIZE, 1,   // With RGB output
+		EGL_GREEN_SIZE, 1,
+		EGL_BLUE_SIZE, 1,
+		EGL_ALPHA_SIZE, 1, // With alpha
+		EGL_DEPTH_SIZE, 1, // And a depth buffer
+		EGL_NONE
+	};
+	/* Will be malloced */
+	EGLConfig the_chosen_one;
+	/* Will receive the number of available configurations */
+	EGLint n_configs = 0;
+	EGLBoolean ret = EGL_FALSE;
+
+	ret = eglChooseConfig(
+		egl_display, config_attribs, &the_chosen_one, 1, &n_configs);
+	if (!ret || n_configs == 0) {
+		LOG_ERROR(
+			"Could not find a configuration with at least :\n"
+			"- EGL Streams support\n"
+			"- OpenGL ES 2.x support\n"
+			"- RGB support\n"
+			"- Alpha and Depth buffers support\n"
+			"Call the police");
+	}
+	else {
+		egl_print_config_attribs(egl_display, the_chosen_one);
+		*egl_config = the_chosen_one;
+	}
+
+	return ret;
+}
+
+static EGLDisplay egl_nvidia_get_display(
+	struct myy_nvidia_functions const * __restrict const nvidia,
+	EGLDeviceEXT const nvidia_device,
+	int const drm_fd)
+{
+	/*
+	 * Provide the DRM fd when creating the EGLDisplay, so that the
+	 * EGL implementation can make any necessary DRM calls using the
+	 * same fd as the application.
+	 */
+	EGLint attribs[] = {
+		EGL_DRM_MASTER_FD_EXT,
+		drm_fd,
+		EGL_NONE
+	};
+
+	return nvidia->eglGetPlatformDisplay(
+		EGL_PLATFORM_DEVICE_EXT,
+		(void*) nvidia_device, attribs);
+}
+
+static int egl_prepare_opengl_context(
+	struct myy_nvidia_functions const * __restrict const nvidia,
+	EGLDeviceEXT const nvidia_device,
+	int const drm_fd)
 {
 	EGLint major, minor, n;
 	GLuint vertex_shader, fragment_shader;
 	GLint ret;
+	EGLBoolean egl_ret = EGL_FALSE;
+	EGLDisplay display;
+	EGLConfig config;
+	EGLContext context;
 
 	static const EGLint context_attribs[] = {
 		EGL_CONTEXT_CLIENT_VERSION, 2,
 		EGL_NONE
 	};
 
-	static const EGLint config_attribs[] = {
-		EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-		EGL_RED_SIZE, 1,
-		EGL_GREEN_SIZE, 1,
-		EGL_BLUE_SIZE, 1,
-		EGL_ALPHA_SIZE, 0,
-		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-		EGL_NONE
-	};
-
-	PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display = NULL;
-	get_platform_display =
-		(void *) eglGetProcAddress("eglGetPlatformDisplayEXT");
-	assert(get_platform_display != NULL);
-
-	gl.display = get_platform_display(EGL_PLATFORM_DEVICE_EXT, gbm.dev, NULL);
+	display = egl_nvidia_get_display(
+		nvidia, nvidia_device, drm_fd);
+	if (display == EGL_NO_DISPLAY) {
+		LOG_ERROR("No display John !");
+		return -1;
+	}
 
 	if (!eglInitialize(gl.display, &major, &minor)) {
-		printf("failed to initialize\n");
+		LOG_ERROR("Could not initialize the display");
 		return -1;
 	}
 
-	printf("Using display %p with EGL version %d.%d\n",
-			gl.display, major, minor);
+	LOGF("Using display %p with EGL version %d.%d",
+		gl.display, major, minor);
 
-	printf("EGL Version \"%s\"\n", eglQueryString(gl.display, EGL_VERSION));
-	printf("EGL Vendor \"%s\"\n", eglQueryString(gl.display, EGL_VENDOR));
-	printf("EGL Extensions \"%s\"\n", eglQueryString(gl.display, EGL_EXTENSIONS));
+	LOGF("EGL Version \"%s\"", eglQueryString(gl.display, EGL_VERSION));
+	LOGF("EGL Vendor \"%s\"", eglQueryString(gl.display, EGL_VENDOR));
+	LOGF("EGL Extensions \"%s\"", eglQueryString(gl.display, EGL_EXTENSIONS));
 
 	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-		printf("failed to bind api EGL_OPENGL_ES_API\n");
+		LOG_ERROR("failed to bind api EGL_OPENGL_ES_API");
 		return -1;
 	}
 
-	if (!eglChooseConfig(gl.display, config_attribs, &gl.config, 1, &n) || n != 1) {
-		printf("failed to choose config: %d\n", n);
+	egl_ret = egl_nvidia_get_config(display, &config);
+	if (egl_ret) {
+		LOGF("No config :C");
 		return -1;
 	}
 
-	gl.context = eglCreateContext(gl.display, gl.config,
+	context = eglCreateContext(gl.display, gl.config,
 			EGL_NO_CONTEXT, context_attribs);
 	if (gl.context == NULL) {
 		printf("failed to create context\n");
 		return -1;
 	}
 
-	gl.surface = eglCreateWindowSurface(gl.display, gl.config, gbm.surface, NULL);
+	/*nvidia->eglGetOutputLayers
+	nvidia->eglCreateStream
+	nvidia->eglStreamConsumerOutput*/
+
+	/*gl.surface = eglCreateWindowSurface(gl.display, gl.config, gbm.surface, NULL);
 	if (gl.surface == EGL_NO_SURFACE) {
 		printf("failed to create egl surface\n");
 		return -1;
 	}*/
 
+	/*gl.config  = config;
+	gl.display = display;*/
 	/* connect the context to the surface */
 	/*eglMakeCurrent(gl.display, gl.surface, gl.surface, gl.context);
 
-	printf("GL Extensions: \"%s\"\n", glGetString(GL_EXTENSIONS));
-
+	printf("GL Extensions: \"%s\"\n", glGetString(GL_EXTENSIONS));*/
+	
 	return 0;
-}*/
+}
 
 /* Draw code here */
 static void draw(uint32_t i)
@@ -452,34 +832,6 @@ static void draw(uint32_t i)
 	glClearColor(0.2f, 0.3f, 0.5f, 1.0f);
 }
 
-/*static struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
-{
-	struct drm_fb *fb = gbm_bo_get_user_data(bo);
-	uint32_t width, height, stride, handle;
-	int ret;
-
-	if (fb)
-		return fb;
-
-	fb = calloc(1, sizeof *fb);
-	fb->bo = bo;
-
-	width = gbm_bo_get_width(bo);
-	height = gbm_bo_get_height(bo);
-	stride = gbm_bo_get_stride(bo);
-	handle = gbm_bo_get_handle(bo).u32;
-
-	ret = drmModeAddFB(drm.fd, width, height, 24, 32, stride, handle, &fb->fb_id);
-	if (ret) {
-		printf("failed to create fb: %s\n", strerror(errno));
-		free(fb);
-		return NULL;
-	}
-
-	gbm_bo_set_user_data(bo, fb, drm_fb_destroy_callback);
-
-	return fb;
-}*/
 
 static void page_flip_handler(int fd, unsigned int frame,
 		  unsigned int sec, unsigned int usec, void *data)
@@ -595,30 +947,6 @@ int nvidia_egl_get_device(
 		goto could_not_query_devices;
 	}
 
-	/*
-	* Select which EGLDeviceEXT to use.
-	*
-	* The EGL_EXT_device_query extension defines the functions:
-	*
-	*   eglQueryDeviceAttribEXT()
-	*   eglQueryDeviceStringEXT()
-	*
-	* as ways to generically query properties of EGLDeviceEXTs, and
-	* separate EGL extensions define EGLDeviceEXT attributes that can
-	* be queried through those functions.  E.g.,
-	*
-	* - EGL_NV_device_cuda lets you query the CUDA device ID
-	*   (EGL_CUDA_DEVICE_NV of an EGLDeviceEXT.
-	*
-	* - EGL_EXT_device_drm lets you query the DRM device file
-	*   (EGL_DRM_DEVICE_FILE_EXT) of an EGLDeviceEXT.
-	*
-	* Future extensions could define other EGLDeviceEXT attributes
-	* such as PCI BusID.
-	*
-	* For now, just choose the first device that supports EGL_EXT_device_drm.
-	*/
-// 
 	char const * __restrict const checked_extensions[] = {
 		"EGL_EXT_device_drm",
 		(char *) 0
@@ -678,7 +1006,7 @@ int main(int argc, char *argv[])
 	uint32_t i = 0;
 	int ret;
 	struct myy_nvidia_functions myy_nvidia;
-
+	myy_drm_infos_t drm;
 
 	ret = myy_nvidia_functions_prepare(&myy_nvidia);
 	if (ret) {
@@ -713,15 +1041,17 @@ int main(int argc, char *argv[])
 		return ret;
 	}
 
-	ret = nvidia_drm_open(&myy_nvidia, nvidia_device);
+	ret = nvidia_drm_open(&myy_nvidia, nvidia_device, &drm);
 	if (ret) {
 		LOGF("failed to initialize DRM");
 		return ret;
 	}
-
 	close(drm.fd);
 	exit(1);
-	
+
+
+	ret = egl_prepare_opengl_context(
+		&myy_nvidia, nvidia_device, drm.fd);
 	if (ret) {
 		printf("failed to initialize EGL\n");
 		return ret;
