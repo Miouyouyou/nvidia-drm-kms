@@ -59,17 +59,17 @@
 #define LOGVF(fmt, ...) fprintf(stdout, fmt "\n", ##__VA_ARGS__)
 
 #define LOG_ERROR(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#define LOG_EGL_ERROR(fmt, ...) do {\
+	fprintf(stderr, fmt "\n", ##__VA_ARGS__); \
+} while(0)
 
-static struct {
+struct myy_opengl_infos {
 	EGLDisplay display;
 	EGLConfig config;
 	EGLContext context;
 	EGLSurface surface;
-	GLuint program;
-	GLint modelviewmatrix, modelviewprojectionmatrix, normalmatrix;
-	GLuint vbo;
-	GLuint positionsoffset, colorsoffset, normalsoffset;
-} gl;
+};
+typedef struct myy_opengl_infos myy_opengl_infos_t;
 
 struct myy_drm_infos {
 	int fd;
@@ -77,6 +77,11 @@ struct myy_drm_infos {
 	uint32_t crtc_id;
 	uint32_t plane_id;
 	uint32_t connector_id;
+	uint32_t width;
+	uint32_t height;
+	uint32_t framebuffer_id;
+	uint32_t mode_blob_id;
+	uint8_t * __restrict framebuffer;
 };
 typedef struct myy_drm_infos myy_drm_infos_t;
 
@@ -99,6 +104,22 @@ struct myy_drm_caps {
 	int const cap_code;
 	int const cap_arg;
 };
+
+static void myy_drm_config_print(
+	myy_drm_infos_t * __restrict const myy_drm_conf)
+{
+	LOGF("[Current DRM config]\n"
+		"\tfd           = %d\n"
+		"\tmode         = %p\n"
+		"\tcrtc_id      = %u\n"
+		"\tplane_id     = %u\n"
+		"\tconnector_id = %u\n",
+		myy_drm_conf->fd          ,
+		myy_drm_conf->mode        ,
+		myy_drm_conf->crtc_id     ,
+		myy_drm_conf->plane_id    ,
+		myy_drm_conf->connector_id);
+}
 
 /* Ugh... yeah... How about eglCheckForExtension("name", TYPE) ?
  * Anyway, eglQueryString will return a space-separated list of
@@ -573,7 +594,8 @@ static uint32_t drm_get_primary_plane_for_crtc(
 	return plane_id;
 }
 
-static int init_drm(
+
+static int drm_init(
 	char const * __restrict const drm_device_file,
 	myy_drm_infos_t * __restrict const myy_drm_conf)
 {
@@ -648,11 +670,15 @@ static int init_drm(
 		goto no_drm_primary_plane;
 	}
 
+	drmModeFreeResources(resources);
+
 	myy_drm_conf->fd           = drm_fd;
 	myy_drm_conf->mode         = mode;
 	myy_drm_conf->crtc_id      = crtc_id;
 	myy_drm_conf->plane_id     = plane_id;
 	myy_drm_conf->connector_id = connector->connector_id;
+	myy_drm_conf->width        = mode->hdisplay;
+	myy_drm_conf->height       = mode->vdisplay;
 
 	return 0;
 
@@ -668,6 +694,120 @@ required_caps_not_available:
 no_drm_device:
 	return -1;
 }
+
+/* drm_create_mode_handle ? */
+static uint32_t drm_create_mode_id(
+	myy_drm_infos_t * __restrict const myy_drm_conf)
+{
+	uint32_t mode_id = 0;
+	int const ret = drmModeCreatePropertyBlob(
+		myy_drm_conf->drm_fd,
+		&myy_drm_conf->mode,
+		sizeof(myy_drm_conf->mode),
+		&mode_id);
+	if (ret != 0) {
+		LOG_ERROR(
+			"Could not create a 'property blob'\n"
+			"Whatever that means...");
+		mode_id = 0;
+	}
+	return mode_id;
+}
+static int drm_map_framebuffer(
+	myy_drm_infos_t * __restrict const myy_drm_conf)
+{
+	struct drm_mode_create_dumb dumb_create_req = { 0 };
+	struct drm_mode_map_dumb dumb_map_req = { 0 };
+
+	/* We won't use it. Go figure.
+	 * It's a CPU mapped buffer.
+	 * Why would would we use it with a GPU ?
+	 * Got zero idea.
+	 * But without it, nothing works.
+	 */
+	uint8_t * __restrict const framebuffer;
+
+	uint32_t fb = 0;
+	int ret;
+	int const drm_fd = myy_drm_conf->fd;
+	uint32_t const width = myy_drm_conf->width;
+	uint32_t const height = myy_drm_conf->height;
+
+	dumb_create_req.width  = myy_drm_conf->width;
+	dumb_create_req.height = myy_drm_conf->height;
+	dumb_create_req.bpp    = 32;
+
+	ret = drmIoctl(drm_fd,
+		DRM_IOCTL_MODE_CREATE_DUMB,
+		&dumb_create_req);
+	if (ret < 0) {
+		LOGF("Could create a dumb frame buffer.");
+		goto create_dumb_buffer_failed;
+	}
+
+	ret = drmModeAddFB(
+		drm_fd, width, height, 24, 32,
+		dumb_create_req.pitch, dumb_create_req.handle,
+		&fb);
+	if (ret < 0) {
+		LOG_ERROR("No framebuffer ?");
+		goto no_frame_buffer;
+	}
+
+	dumb_map_req.handle = dumb_create_req.handle;
+
+	ret = drmIoctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB,
+		&dumb_map_req);
+	if (ret) {
+		LOG_ERROR("Unable to map dumb buffer.\n");
+		goto could_not_map_dumb_buffer;
+	}
+
+	framebuffer = mmap(
+		0, dumb_create_req.size, PROT_READ | PROT_WRITE,
+		MAP_SHARED, drm_fd, dumb_map_req.offset);
+	if (framebuffer == MAP_FAILED) {
+		LOG_ERROR("Failed to mmap our framebuffer : %m\n");
+		goto could_not_mmap_frame_buffer;
+	}
+
+	memset(framebuffer, 0, dumb_create_req.size);
+
+	myy_drm_conf->framebuffer_id = fb;
+	myy_drm_conf->framebuffer    = framebuffer;
+	return 0;
+
+/* TODO Unmap framebuffer ? */
+could_not_mmap_frame_buffer:
+/* TODO Unmap dumb buffer ! */
+could_not_map_dumb_buffer:
+/* TODO Remove FB */
+no_frame_buffer;
+/* TODO Destroy dumb buffer ! */
+create_dumb_buffer_failed:
+	return -1;
+	
+}
+
+static void drm_make_atomic(
+	myy_drm_infos_t const * __restrict const myy_drm_conf,
+	drmModeAtomicReq * __restrict const atomic_request,
+	uint32_t const mode_blob_id)
+{
+	int const drm_fd =
+		myy_drm_conf->fd;
+	uint32_t const width =
+		myy_drm_conf->width;
+	uint32_t const height =
+		myy_drm_conf->height;
+	uint32_t const mode_blob_id =
+		myy_drm_conf->mode_blob_id;
+	uint32_t const framebuffer_id =
+		myy_drm_conf->framebuffer_id;
+
+	/* RESUME FROM HERE */
+}
+	
 
 static int nvidia_drm_open(
 	struct myy_nvidia_functions const * __restrict const myy_nvidia,
@@ -691,7 +831,7 @@ static int nvidia_drm_open(
 		ret = -1;
 	}
 
-	ret = init_drm(drm_device_filepath, myy_drm_conf);
+	ret = drm_init(drm_device_filepath, myy_drm_conf);
 	return ret;
 }
 
@@ -721,7 +861,7 @@ static EGLBoolean egl_nvidia_get_config(
 	ret = eglChooseConfig(
 		egl_display, config_attribs, &the_chosen_one, 1, &n_configs);
 	if (!ret || n_configs == 0) {
-		LOG_ERROR(
+		LOG_EGL_ERROR(
 			"Could not find a configuration with at least :\n"
 			"- EGL Streams support\n"
 			"- OpenGL ES 2.x support\n"
@@ -758,10 +898,122 @@ static EGLDisplay egl_nvidia_get_display(
 		(void*) nvidia_device, attribs);
 }
 
+static EGLBoolean nvidia_egl_create_surface(
+	struct myy_nvidia_functions const * __restrict const nvidia,
+	EGLDisplay egl_display,
+	EGLConfig egl_config,
+	myy_drm_infos_t const * __restrict const myy_drm_conf,
+	EGLSurface * __restrict const egl_surface)
+{
+	EGLAttrib const layer_attribs[] = {
+		EGL_DRM_PLANE_EXT,
+		myy_drm_conf->plane_id,
+		EGL_NONE,
+	};
+
+	EGLint const surface_attribs[] = {
+		EGL_WIDTH, myy_drm_conf->width,
+		EGL_HEIGHT, myy_drm_conf->height,
+		EGL_NONE
+	};
+
+	EGLint const stream_attribs[] = { EGL_NONE };
+
+	EGLOutputLayerEXT egl_layer;
+	EGLStreamKHR egl_stream;
+	EGLBoolean ret = EGL_FALSE;
+	EGLSurface surface = EGL_NO_SURFACE;
+	EGLint n;
+	 /* Find the EGLOutputLayer that corresponds to the DRM KMS plane. */
+	ret = nvidia->eglGetOutputLayers(
+		egl_display, layer_attribs, &egl_layer, 1, &n);
+
+    if (!ret || n == 0)
+	{
+		LOG_EGL_ERROR(
+			"Unable to get EGLOutputLayer for plane 0x%08x\n",
+			myy_drm_conf->plane_id);
+		goto no_egl_output_layers;
+	}
+
+	/* Create an EGLStream. */
+	egl_stream = nvidia->eglCreateStream(
+		egl_display, stream_attribs);
+
+	if (egl_stream == EGL_NO_STREAM_KHR) {
+		LOG_EGL_ERROR("Unable to create stream.\n");
+		goto no_egl_stream;
+	}
+
+	/* Set the EGLOutputLayer as the consumer of the EGLStream. */
+	ret = nvidia->eglStreamConsumerOutput(
+		egl_display,
+		egl_stream,
+		egl_layer);
+
+	if (!ret) {
+		LOG_EGL_ERROR("Unable to create EGLOutput stream consumer.\n");
+		goto no_egl_stream_consumer_output;
+	}
+
+	/*
+	 * EGL_KHR_stream defines that normally stream consumers need to
+	 * explicitly retrieve frames from the stream.  That may be useful
+	 * when we attempt to better integrate
+	 * EGL_EXT_stream_consumer_egloutput with DRM atomic KMS requests.
+	 * But, EGL_EXT_stream_consumer_egloutput defines that by default:
+	 *
+	 *   On success, <layer> is bound to <stream>, <stream> is placed
+	 *   in the EGL_STREAM_STATE_CONNECTING_KHR state, and EGL_TRUE is
+	 *   returned.  Initially, no changes occur to the image displayed
+	 *   on <layer>. When the <stream> enters state
+	 *   EGL_STREAM_STATE_NEW_FRAME_AVAILABLE_KHR, <layer> will begin
+	 *   displaying frames, without further action required on the
+	 *   application's part, as they become available, taking into
+	 *   account any timestamps, swap intervals, or other limitations
+	 *   imposed by the stream or producer attributes.
+	 *
+	 * So, eglSwapBuffers() (to produce new frames) is sufficient for
+	 * the frames to be displayed.  That behavior can be altered with
+	 * the EGL_EXT_stream_acquire_mode extension.
+	 */
+
+	/*
+	 * Create an EGLSurface as the producer of the EGLStream.  Once
+	 * the stream's producer and consumer are defined, the stream is
+	 * ready to use.  eglSwapBuffers() calls for the EGLSurface will
+	 * deliver to the stream's consumer, i.e., the DRM KMS plane
+	 * corresponding to the EGLOutputLayer.
+	 */
+
+	surface = nvidia->eglCreateStreamProducerSurface(
+		egl_display, egl_config, egl_stream, surface_attribs);
+
+	if (surface == EGL_NO_SURFACE) {
+		LOG_EGL_ERROR(
+			"Could not create a surface through NVIDIA means\n");
+		goto no_egl_surface;
+	}
+
+	*egl_surface = surface;
+
+	return EGL_TRUE;
+
+no_egl_surface:
+/* eglDestroyStreamProducerSurface ? */
+no_egl_stream_consumer_output:
+/* Destroy Stream here */
+
+no_egl_stream:
+no_egl_output_layers:
+	return EGL_FALSE;
+}
+
 static int egl_prepare_opengl_context(
 	struct myy_nvidia_functions const * __restrict const nvidia,
 	EGLDeviceEXT const nvidia_device,
-	int const drm_fd)
+	myy_drm_infos_t * __restrict const myy_drm_conf,
+	myy_opengl_infos_t * __restrict const myy_gl_conf)
 {
 	EGLint major, minor, n;
 	GLuint vertex_shader, fragment_shader;
@@ -770,67 +1022,85 @@ static int egl_prepare_opengl_context(
 	EGLDisplay display;
 	EGLConfig config;
 	EGLContext context;
+	EGLSurface surface;
 
-	static const EGLint context_attribs[] = {
+	EGLint const context_attribs[] = {
 		EGL_CONTEXT_CLIENT_VERSION, 2,
 		EGL_NONE
 	};
 
 	display = egl_nvidia_get_display(
-		nvidia, nvidia_device, drm_fd);
+		nvidia, nvidia_device, myy_drm_conf->fd);
 	if (display == EGL_NO_DISPLAY) {
-		LOG_ERROR("No display John !");
-		return -1;
+		LOG_EGL_ERROR("No display John !");
+		goto no_egl_display;
 	}
 
-	if (!eglInitialize(gl.display, &major, &minor)) {
-		LOG_ERROR("Could not initialize the display");
-		return -1;
+	if (!eglInitialize(display, &major, &minor)) {
+		LOG_EGL_ERROR("Could not initialize the display");
+		goto cannot_initialize_egl;
 	}
 
 	LOGF("Using display %p with EGL version %d.%d",
-		gl.display, major, minor);
+		display, major, minor);
 
-	LOGF("EGL Version \"%s\"", eglQueryString(gl.display, EGL_VERSION));
-	LOGF("EGL Vendor \"%s\"", eglQueryString(gl.display, EGL_VENDOR));
-	LOGF("EGL Extensions \"%s\"", eglQueryString(gl.display, EGL_EXTENSIONS));
+	LOGF("EGL Version \"%s\"", eglQueryString(display, EGL_VERSION));
+	LOGF("EGL Vendor \"%s\"", eglQueryString(display, EGL_VENDOR));
+	LOGF("EGL Extensions \"%s\"", eglQueryString(display, EGL_EXTENSIONS));
 
 	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-		LOG_ERROR("failed to bind api EGL_OPENGL_ES_API");
-		return -1;
+		LOG_EGL_ERROR(
+			"Failed to bind api EGL_OPENGL_ES_API");
+		goto no_opengl_es_api;
 	}
 
 	egl_ret = egl_nvidia_get_config(display, &config);
-	if (egl_ret) {
+	if (egl_ret == EGL_FALSE) {
 		LOGF("No config :C");
-		return -1;
+		goto no_egl_config;
 	}
 
-	context = eglCreateContext(gl.display, gl.config,
-			EGL_NO_CONTEXT, context_attribs);
-	if (gl.context == NULL) {
-		printf("failed to create context\n");
-		return -1;
+	context = eglCreateContext(display, config,
+		EGL_NO_CONTEXT, context_attribs);
+	if (context == NULL) {
+		LOG_EGL_ERROR(
+			"Failed to create an OpenGL ES 2.x context\n");
+		goto no_egl_context;
 	}
 
-	/*nvidia->eglGetOutputLayers
-	nvidia->eglCreateStream
-	nvidia->eglStreamConsumerOutput*/
+	egl_ret = nvidia_egl_create_surface(
+		nvidia, display, config, myy_drm_conf, &surface);
 
-	/*gl.surface = eglCreateWindowSurface(gl.display, gl.config, gbm.surface, NULL);
-	if (gl.surface == EGL_NO_SURFACE) {
-		printf("failed to create egl surface\n");
-		return -1;
-	}*/
+	if (!egl_ret) {
+		LOG_ERROR("No surface !?");
+		goto no_egl_surface;
+	}
 
-	/*gl.config  = config;
-	gl.display = display;*/
-	/* connect the context to the surface */
-	/*eglMakeCurrent(gl.display, gl.surface, gl.surface, gl.context);
+	egl_ret = eglMakeCurrent(
+		display, surface, surface, context);
 
-	printf("GL Extensions: \"%s\"\n", glGetString(GL_EXTENSIONS));*/
-	
+	if (!egl_ret) {
+		LOG_ERROR(
+			"Could not the surface current... ???");
+		goto no_egl_make_current_failed;
+	}
+
+	myy_gl_conf->display = display;
+	myy_gl_conf->config  = config;
+	myy_gl_conf->context = context;
+	myy_gl_conf->surface = surface;
 	return 0;
+
+no_egl_make_current_failed:
+/* TODO Destroy surface here */
+no_egl_surface:
+/* TODO Destroy context here */
+no_egl_context:
+no_egl_config:
+no_opengl_es_api:
+cannot_initialize_egl:
+no_egl_display:
+	return -1;
 }
 
 /* Draw code here */
@@ -862,15 +1132,6 @@ int egl_check_extensions_client(void)
 	char const * __restrict const client_extensions_list = 
 		eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
 	return egl_strstr(client_extensions_list, extension_names, "client");
-}
-
-int egl_check_extensions_nvidia_device(
-	struct myy_nvidia_functions * __restrict const myy_nvidia)
-{
-}
-
-int egl_check_extensions_display(EGLDisplay egl_display)
-{
 }
 
 int myy_nvidia_functions_prepare(
@@ -1015,10 +1276,11 @@ int main(int argc, char *argv[])
 	int ret;
 	struct myy_nvidia_functions myy_nvidia;
 	myy_drm_infos_t drm;
+	myy_opengl_infos_t gl;
 
 	ret = myy_nvidia_functions_prepare(&myy_nvidia);
 	if (ret) {
-		LOGF(
+		LOG_ERROR(
 			"Failed to get the EGL extensions functions addresses "
 			"from your current driver.\n"
 			"This example uses NVIDIA specific extensions so be "
@@ -1028,7 +1290,7 @@ int main(int argc, char *argv[])
 
 	ret = egl_check_extensions_client();
 	if (ret) {
-		LOGF(
+		LOG_ERROR(
 			"... You got the right drivers but not the right "
 			"extensions on your EGL client...\n"
 			"File a bug report with the output of this program "
@@ -1041,7 +1303,7 @@ int main(int argc, char *argv[])
 	EGLDeviceEXT nvidia_device;
 	ret = nvidia_egl_get_device(&myy_nvidia, &nvidia_device);
 	if (ret) {
-		LOGF(
+		LOG_ERROR(
 			"Something went wrong while trying to prepare the "
 			"device.\n"
 			"File a bug report to : \n"
@@ -1051,68 +1313,24 @@ int main(int argc, char *argv[])
 
 	ret = nvidia_drm_open(&myy_nvidia, nvidia_device, &drm);
 	if (ret) {
-		LOGF("failed to initialize DRM");
+		LOG_ERROR(
+			"Failed to initialize DRM through NVIDIA means");
 		return ret;
 	}
-	close(drm.fd);
-	exit(1);
+	myy_drm_config_print(&drm);
 
 
 	ret = egl_prepare_opengl_context(
-		&myy_nvidia, nvidia_device, drm.fd);
+		&myy_nvidia, nvidia_device, &drm, &gl);
 	if (ret) {
-		printf("failed to initialize EGL\n");
-		return ret;
-	}
-
-	/* clear the color buffer */
-	glClearColor(0.5, 0.5, 0.5, 1.0);
-	glClear(GL_COLOR_BUFFER_BIT);
-	eglSwapBuffers(gl.display, gl.surface);
-
-	/* set mode: */
-	ret = drmModeSetCrtc(drm.fd, drm.crtc_id, fb->fb_id, 0, 0,
-			&drm.connector_id, 1, drm.mode);
-	if (ret) {
-		printf("failed to set mode: %s\n", strerror(errno));
+		LOG_ERROR(
+			"Failed to initialize EGL through NVIDIA means");
 		return ret;
 	}
 
 	while (1) {
-		int waiting_for_flip = 1;
-
 		draw(i++);
-
 		eglSwapBuffers(gl.display, gl.surface);
-
-		/*
-		 * Here you could also update drm plane layers if you want
-		 * hw composition
-		 */
-
-		ret = drmModePageFlip(drm.fd, drm.crtc_id, fb->fb_id,
-				DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
-		if (ret) {
-			printf("failed to queue page flip: %s\n", strerror(errno));
-			return -1;
-		}
-
-		while (waiting_for_flip) {
-			ret = select(drm.fd + 1, &fds, NULL, NULL, NULL);
-			if (ret < 0) {
-				printf("select err: %s\n", strerror(errno));
-				return ret;
-			} else if (ret == 0) {
-				printf("select timeout!\n");
-				return -1;
-			} else if (FD_ISSET(0, &fds)) {
-				printf("user interrupted!\n");
-				break;
-			}
-			drmHandleEvent(drm.fd, &evctx);
-		}
-
-		/* release last buffer to render on again: */
 	}
 
 	return ret;
