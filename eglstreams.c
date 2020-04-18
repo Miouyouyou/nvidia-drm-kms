@@ -71,6 +71,7 @@ struct myy_opengl_infos {
 	EGLConfig config;
 	EGLContext context;
 	EGLSurface surface;
+	EGLStreamKHR stream;
 };
 typedef struct myy_opengl_infos myy_opengl_infos_t;
 
@@ -83,7 +84,7 @@ struct myy_drm_infos {
 	uint32_t width;
 	uint32_t height;
 	uint32_t framebuffer_id;
-	uint8_t * __restrict framebuffer;
+	uint32_t has_alpha;
 };
 typedef struct myy_drm_infos myy_drm_infos_t;
 
@@ -95,7 +96,51 @@ struct myy_nvidia_functions {
 	PFNEGLCREATESTREAMKHRPROC eglCreateStream;
 	PFNEGLSTREAMCONSUMEROUTPUTEXTPROC eglStreamConsumerOutput;
 	PFNEGLCREATESTREAMPRODUCERSURFACEKHRPROC eglCreateStreamProducerSurface;
+	PFNEGLDESTROYSTREAMKHRPROC eglDestroyStream;
 };
+
+static int myy_nvidia_functions_prepare(
+	struct myy_nvidia_functions * __restrict const myy_nvidia)
+{
+	/* Fragile code, but this makes the user aware of all the
+	 * extensions he needs at once.
+	 * Now, this array must be synchronized (manually) with
+	 * the structure of function pointers "myy_nvidia_functions"
+	 */
+	char const * __restrict const extension_names[] = {
+		"eglQueryDevicesEXT",
+		"eglQueryDeviceStringEXT",
+		"eglGetPlatformDisplayEXT",
+		"eglGetOutputLayersEXT",
+		"eglCreateStreamKHR",
+		"eglStreamConsumerOutputEXT",
+		"eglCreateStreamProducerSurfaceKHR",
+		"eglDestroyStreamKHR",
+		(char *) 0
+	};
+	char const * __restrict const * __restrict cursor = extension_names;
+
+	void (**extensions_addresses)() = (void(**)()) myy_nvidia;
+	int everything_is_ok = 0;
+
+	while (*cursor != 0) {
+		char const * __restrict const ext_name = *cursor;
+		*extensions_addresses = eglGetProcAddress(ext_name);
+		if (*extensions_addresses == NULL) {
+			everything_is_ok = -1;
+			fprintf(stderr, "Extension '%s' not found :C\n", ext_name);
+			/* We'll still check for the other extensions
+			 * anyway, so that the user knows about EVERY
+			 * single extension he needs at once.
+			 */
+		}
+		extensions_addresses++;
+		cursor++;
+	}
+
+	return everything_is_ok;
+}
+
 
 struct myy_drm_caps {
 	char const * __restrict const name;
@@ -121,6 +166,22 @@ static void myy_drm_config_dump(
 		myy_drm_conf->width,
 		myy_drm_conf->height,
 		myy_drm_conf->framebuffer_id);
+}
+
+static void myy_drm_mode_props_dump(
+	int const drm_fd,
+	drmModeObjectProperties const * __restrict const mode_props)
+{
+	LOGF("[Listing DRM Mode properties]\n");
+	for (uint32_t i = 0; i < mode_props->count_props; i++) {
+		drmModePropertyRes * __restrict const prop =
+			drmModeGetProperty(drm_fd, mode_props->props[i]);
+		if (prop) {
+			LOGF("\t%s (%d) : %lx\n",
+				 prop->name, prop->prop_id, mode_props->prop_values[i]);
+			drmModeFreeProperty(prop);
+		}
+	}
 }
 
 /* Ugh... yeah... How about eglCheckForExtension("name", TYPE) ?
@@ -504,6 +565,7 @@ static uint64_t drm_get_property(
 		drmModeObjectGetProperties(drm_fd, object_id, object_type);
 	uint32_t const n_props = object_properties->count_props;
 
+	myy_drm_mode_props_dump(drm_fd, object_properties);
 	for (uint32_t i = 0; (found == 0) & (i < n_props); i++) {
 
 		drmModePropertyRes * __restrict const prop =
@@ -536,6 +598,59 @@ static uint64_t drm_get_property(
 	return value;
 }
 
+static void myy_drm_plane_dump(
+	int const drm_fd,
+	int const plane_i)
+{
+	drmModePlane * __restrict const plane =
+		drmModeGetPlane(drm_fd, plane_i);
+	if (plane) {
+		LOGF(
+			"[Dumping plane info]\n"
+			"\tplane_id       : %u\n"
+			"\tcrtc_id;       : %u\n"
+			"\tfb_id;         : %u\n"
+			"\tcrtc_x, crtc_y;: %u, %u\n"
+			"\tx, y;          : %u, %u\n"
+			"\tpossible_crtcs;: %08X\n"
+			"\tgamma_size;    : %u",
+			plane->plane_id,
+			plane->crtc_id,
+			plane->fb_id,
+			plane->crtc_x, plane->crtc_y,
+			plane->x, plane->y,
+			plane->possible_crtcs,
+			plane->gamma_size);
+		LOGF("\t[Dumping plane formats]\n");
+		for (uint32_t i = 0; i < plane->count_formats; i++) {
+			char const * __restrict const fmt_name =
+				(char const * __restrict) plane->formats+i;
+			LOGF("\t\tFormat : %c%c%c%c",
+				 fmt_name[0], fmt_name[1], fmt_name[2], fmt_name[3]);
+		}
+		drmModeFreePlane(plane);
+	}
+}
+
+static void myy_drm_planes_dump(
+	int const drm_fd, 
+	drmModePlaneRes const * __restrict const planes)
+{
+	uint32_t const n_planes = planes->count_planes;
+	for (uint32_t i = 0; i < n_planes; i++) {
+		uint32_t plane_i = planes->planes[i];
+
+		myy_drm_plane_dump(drm_fd, plane_i);
+		drmModeObjectProperties * __restrict const object_properties =
+			drmModeObjectGetProperties(
+				drm_fd, plane_i, DRM_MODE_OBJECT_PLANE);
+		if (object_properties) {
+			myy_drm_mode_props_dump(drm_fd, object_properties);
+			drmModeFreeObjectProperties(object_properties);
+		}
+	}
+}
+
 #define NO_PLANE_FOUND (0)
 static uint32_t drm_get_primary_plane_for_crtc(
 	int drm_fd,
@@ -546,6 +661,7 @@ static uint32_t drm_get_primary_plane_for_crtc(
 		drmModeGetPlaneResources(drm_fd);
 
 	if (planes_resources != NULL) {
+		myy_drm_planes_dump(drm_fd, planes_resources);
 		uint32_t const n_planes = planes_resources->count_planes;
 
 		for (uint32_t i = 0;
@@ -571,14 +687,22 @@ static uint32_t drm_get_primary_plane_for_crtc(
 				continue;
 			}
 
-			int property_found = 0;
+			int type_found = 0;
 			uint64_t const type = drm_get_property(
 				drm_fd,
 				plane_i,
 				DRM_MODE_OBJECT_PLANE,
 				"type",
-				&property_found);
-			if ((property_found) & (type == DRM_PLANE_TYPE_PRIMARY))
+				&type_found);
+
+			int alpha_found = 0;
+			uint64_t const alpha = drm_get_property(
+				drm_fd,
+				plane_i,
+				DRM_MODE_OBJECT_PLANE,
+				"alpha",
+				&alpha_found);
+			if (((type_found) & (type == DRM_PLANE_TYPE_PRIMARY)))
 			{
 				plane_id = plane_i;
 			}
@@ -774,7 +898,6 @@ static bool drm_map_framebuffer(
 	memset(framebuffer, 0, dumb_create_req.size);
 
 	myy_drm_conf->framebuffer_id = fb;
-	myy_drm_conf->framebuffer    = framebuffer;
 	return true;
 
 /* TODO Unmap framebuffer ? */
@@ -811,6 +934,8 @@ static bool myy_drm_kms_get_prop_ids(
 			 object_id, object_type);
 		goto no_props;
 	}
+
+	myy_drm_mode_props_dump(drm_fd, drm_mode_props);
 
 	for (uint32_t i = 0; i < drm_mode_props->count_props; i++) {
 		drmModePropertyRes * __restrict const prop =
@@ -881,6 +1006,7 @@ struct myy_drm_atomic_props_ids {
 		uint32_t crtc_h;
 		uint32_t fb_id;
 		uint32_t crtc_id;
+		uint32_t alpha;
 	} plane;
 };
 
@@ -944,7 +1070,11 @@ static bool myy_drm_atomic_get_props_ids(
 		{ "CRTC_ID", &prop_ids->plane.crtc_id     },
 	};
 
-	return (
+	struct myy_kms_prop_id const plane_optional_props[] = {
+		{ "alpha",   &prop_ids->plane.alpha       },
+	};
+
+	bool const got_main_props =
 		myy_drm_kms_get_prop_ids(
 			drm_fd, myy_drm_conf->crtc_id,
 			DRM_MODE_OBJECT_CRTC,
@@ -956,8 +1086,17 @@ static bool myy_drm_atomic_get_props_ids(
 		&& myy_drm_kms_get_prop_ids(
 			drm_fd, myy_drm_conf->plane_id,
 			DRM_MODE_OBJECT_PLANE,
-			plane_props, ARRAY_SIZE(plane_props))
-	);
+			plane_props, ARRAY_SIZE(plane_props));
+
+	if (got_main_props) {
+		/* Try to get the optional "ALPHA" property */
+		myy_drm_kms_get_prop_ids(
+			drm_fd, myy_drm_conf->plane_id,
+			DRM_MODE_OBJECT_PLANE,
+			plane_optional_props, ARRAY_SIZE(plane_optional_props));
+	}
+
+	return got_main_props;
 }
 
 #define myy_set_atomic_add_prop(request, element_id, prop_id, prop_val) \
@@ -1084,6 +1223,12 @@ static bool drm_setup_atomic_mode_for_streams(
 		myy_set_atomic_add_prop(
 			atomic_request, drm_conf.plane_id,
 			props_ids.plane.crtc_id, drm_conf.crtc_id);
+
+		if (props_ids.plane.alpha) {
+			myy_set_atomic_add_prop(
+				atomic_request, drm_conf.plane_id,
+				props_ids.plane.alpha, 0xff);
+		}
 	}
 
 	i_ret = drmModeAtomicCommit(
@@ -1107,7 +1252,7 @@ no_atomic_request:
 }
 	
 
-static int nvidia_attach_streams_to_drm(
+static int nvidia_prepare_drm_for_streams(
 	myy_drm_infos_t * __restrict const myy_drm_conf)
 {
 	uint32_t const mode_blob_id =
@@ -1166,7 +1311,7 @@ static int nvidia_drm_open(
 		goto could_not_initialise_drm;
 	}
 
-	ret = nvidia_attach_streams_to_drm(myy_drm_conf);
+	ret = nvidia_prepare_drm_for_streams(myy_drm_conf);
 	if (ret == -1) {
 		LOG_ERROR(
 			"Could not connect NVIDIA EGL Streams to the DRM "
@@ -1251,7 +1396,8 @@ static EGLBoolean nvidia_egl_create_surface(
 	EGLDisplay egl_display,
 	EGLConfig egl_config,
 	myy_drm_infos_t const * __restrict const myy_drm_conf,
-	EGLSurface * __restrict const egl_surface)
+	EGLSurface * __restrict const egl_surface,
+	EGLStreamKHR * __restrict const egl_stream)
 {
 	EGLAttrib const layer_attribs[] = {
 		EGL_DRM_PLANE_EXT,
@@ -1268,7 +1414,7 @@ static EGLBoolean nvidia_egl_create_surface(
 	EGLint const stream_attribs[] = { EGL_NONE };
 
 	EGLOutputLayerEXT egl_layer;
-	EGLStreamKHR egl_stream;
+	EGLStreamKHR stream;
 	EGLBoolean ret = EGL_FALSE;
 	EGLSurface surface = EGL_NO_SURFACE;
 	EGLint n;
@@ -1292,9 +1438,9 @@ static EGLBoolean nvidia_egl_create_surface(
 	}
 
 	/* Create an EGLStream. */
-	egl_stream = nvidia->eglCreateStream(egl_display, stream_attribs);
+	stream = nvidia->eglCreateStream(egl_display, stream_attribs);
 
-	if (egl_stream == EGL_NO_STREAM_KHR) {
+	if (stream == EGL_NO_STREAM_KHR) {
 		LOG_EGL_ERROR("Unable to create stream.\n");
 		goto no_egl_stream;
 	}
@@ -1302,7 +1448,7 @@ static EGLBoolean nvidia_egl_create_surface(
 	/* Set the EGLOutputLayer as the consumer of the EGLStream. */
 	ret = nvidia->eglStreamConsumerOutput(
 		egl_display,
-		egl_stream,
+		stream,
 		egl_layer);
 
 	if (!ret) {
@@ -1341,7 +1487,7 @@ static EGLBoolean nvidia_egl_create_surface(
 	 */
 
 	surface = nvidia->eglCreateStreamProducerSurface(
-		egl_display, egl_config, egl_stream, surface_attribs);
+		egl_display, egl_config, stream, surface_attribs);
 
 	if (surface == EGL_NO_SURFACE) {
 		LOG_EGL_ERROR(
@@ -1350,17 +1496,27 @@ static EGLBoolean nvidia_egl_create_surface(
 	}
 
 	*egl_surface = surface;
+	*egl_stream  = stream;
 
 	return EGL_TRUE;
 
-no_egl_surface:
-/* eglDestroyStreamProducerSurface ? */
-no_egl_stream_consumer_output:
-/* Destroy Stream here */
 
+no_egl_surface:
+no_egl_stream_consumer_output:
+	nvidia->eglDestroyStream(egl_display, egl_stream);
 no_egl_stream:
 no_egl_output_layers:
 	return EGL_FALSE;
+}
+
+static void nvidia_egl_destroy_surface(
+	struct myy_nvidia_functions const * __restrict const nvidia,
+	EGLDisplay egl_display,
+	EGLSurface egl_surface,
+	EGLStreamKHR egl_stream)
+{
+	nvidia->eglDestroyStream(egl_display, egl_stream);
+	eglDestroySurface(egl_display, egl_surface);
 }
 
 static int egl_prepare_opengl_context(
@@ -1375,6 +1531,7 @@ static int egl_prepare_opengl_context(
 	EGLConfig config;
 	EGLContext context;
 	EGLSurface surface;
+	EGLStreamKHR stream;
 
 	EGLint const context_attribs[] = {
 		EGL_CONTEXT_CLIENT_VERSION, 2,
@@ -1421,7 +1578,7 @@ static int egl_prepare_opengl_context(
 	}
 
 	egl_ret = nvidia_egl_create_surface(
-		nvidia, display, config, myy_drm_conf, &surface);
+		nvidia, display, config, myy_drm_conf, &surface, &stream);
 
 	if (!egl_ret) {
 		LOG_ERROR("No surface !?");
@@ -1441,25 +1598,42 @@ static int egl_prepare_opengl_context(
 	myy_gl_conf->config  = config;
 	myy_gl_conf->context = context;
 	myy_gl_conf->surface = surface;
+	myy_gl_conf->stream  = stream;
 	return 0;
 
 no_egl_make_current_failed:
-/* TODO Destroy surface here */
+	nvidia_egl_destroy_surface(nvidia, display, surface, stream);
 no_egl_surface:
-/* TODO Destroy context here */
+	eglDestroyContext(display, context);
 no_egl_context:
 no_egl_config:
 no_opengl_es_api:
+	eglTerminate(display);
 cannot_initialize_egl:
 no_egl_display:
 	return -1;
+}
+
+static void egl_destroy_opengl_context(
+	struct myy_nvidia_functions const * __restrict const nvidia,
+	myy_opengl_infos_t * __restrict const myy_gl_conf)
+{
+	nvidia_egl_destroy_surface(
+		nvidia,
+		myy_gl_conf->display,
+		myy_gl_conf->surface,
+		myy_gl_conf->stream);
+	eglDestroyContext(
+		myy_gl_conf->display,
+		myy_gl_conf->context);
+	eglTerminate(
+		myy_gl_conf->display);
 }
 
 /* Draw code here */
 static void draw(uint32_t i)
 {
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-	printf("glClear -> %d\n", glGetError());
 	glClearColor(0.2f, 0.3f, 0.5f, 1.0f);
 }
 
@@ -1477,47 +1651,6 @@ int egl_check_extensions_client(void)
 	char const * __restrict const client_extensions_list = 
 		eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
 	return egl_strstr(client_extensions_list, extension_names, "client");
-}
-
-int myy_nvidia_functions_prepare(
-	struct myy_nvidia_functions * __restrict const myy_nvidia)
-{
-	/* Fragile code, but this makes the user aware of all the
-	 * extensions he needs at once.
-	 * Now, this array must be synchronized (manually) with
-	 * the structure of function pointers "myy_nvidia_functions"
-	 */
-	char const * __restrict const extension_names[] = {
-		"eglQueryDevicesEXT",
-		"eglQueryDeviceStringEXT",
-		"eglGetPlatformDisplayEXT",
-		"eglGetOutputLayersEXT",
-		"eglCreateStreamKHR",
-		"eglStreamConsumerOutputEXT",
-		"eglCreateStreamProducerSurfaceKHR",
-		(char *) 0
-	};
-	char const * __restrict const * __restrict cursor = extension_names;
-
-	void (**extensions_addresses)() = (void(**)()) myy_nvidia;
-	int everything_is_ok = 0;
-
-	while (*cursor != 0) {
-		char const * __restrict const ext_name = *cursor;
-		*extensions_addresses = eglGetProcAddress(ext_name);
-		if (*extensions_addresses == NULL) {
-			everything_is_ok = -1;
-			fprintf(stderr, "Extension '%s' not found :C\n", ext_name);
-			/* We'll still check for the other extensions
-			 * anyway, so that the user knows about EVERY
-			 * single extension he needs at once.
-			 */
-		}
-		extensions_addresses++;
-		cursor++;
-	}
-
-	return everything_is_ok;
 }
 
 int nvidia_egl_get_device(
@@ -1630,7 +1763,7 @@ int main(int argc, char *argv[])
 	struct myy_nvidia_functions myy_nvidia = {0};
 	myy_drm_infos_t drm = {0};
 	myy_opengl_infos_t gl = {0};
-	uint8_t * __restrict pixel_pweep;
+	EGLDeviceEXT nvidia_device;
 
 	ret = myy_nvidia_functions_prepare(&myy_nvidia);
 	if (ret) {
@@ -1653,8 +1786,6 @@ int main(int argc, char *argv[])
 		return ret;
 	}
 
-	/* TODO Move inside the struct */
-	EGLDeviceEXT nvidia_device;
 	ret = nvidia_egl_get_device(&myy_nvidia, &nvidia_device);
 	if (ret) {
 		LOG_ERROR(
@@ -1671,8 +1802,6 @@ int main(int argc, char *argv[])
 			"Failed to initialize DRM through NVIDIA means");
 		return ret;
 	}
-	myy_drm_config_dump(&drm);
-
 
 	ret = egl_prepare_opengl_context(
 		&myy_nvidia, nvidia_device, &drm, &gl);
@@ -1682,13 +1811,6 @@ int main(int argc, char *argv[])
 		return ret;
 	}
 
-	
-	pixel_pweep = (uint8_t *) malloc(1920*1080*4);
-	glClear(GL_COLOR_BUFFER_BIT);
-	glClearColor(0.2f, 0.5f, 0.8f, 1.0f);
-	eglSwapBuffers(gl.display, gl.surface);
-	glReadPixels(0, 0, 1920, 1080, GL_RGBA, GL_BYTE, pixel_pweep);
-	dump_buffer_to_file(pixel_pweep, 1920*1080*4);
 	while (1) {
 		draw(i++);
 		if (!eglSwapBuffers(gl.display, gl.surface)) {
