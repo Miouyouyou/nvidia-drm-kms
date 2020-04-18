@@ -87,10 +87,6 @@ struct myy_drm_infos {
 };
 typedef struct myy_drm_infos myy_drm_infos_t;
 
-struct drm_fb {
-	uint32_t fb_id;
-};
-
 struct myy_nvidia_functions {
 	PFNEGLQUERYDEVICESEXTPROC eglQueryDevices;
 	PFNEGLQUERYDEVICESTRINGEXTPROC eglQueryDeviceString;
@@ -1095,8 +1091,8 @@ static bool drm_setup_atomic_mode_for_streams(
 		DRM_MODE_ATOMIC_ALLOW_MODESET,
 		NULL);
 	if (i_ret != 0) {
-		LOGF("Oh, the NVIDIA driver failed for no fucking reason ! %d\n",
-			i_ret);
+		LOGF("Commiting the Atomic configuration for EGL Streams "
+			"failed with error %d\n", i_ret);
 		goto could_not_commit;
 	}
 
@@ -1200,7 +1196,7 @@ static EGLBoolean egl_nvidia_get_config(
 		EGL_RED_SIZE, 1,   // With RGB output
 		EGL_GREEN_SIZE, 1,
 		EGL_BLUE_SIZE, 1,
-		EGL_ALPHA_SIZE, 1, // With alpha
+		EGL_ALPHA_SIZE, 0, // With alpha
 		EGL_DEPTH_SIZE, 1, // And a depth buffer
 		EGL_NONE
 	};
@@ -1276,6 +1272,13 @@ static EGLBoolean nvidia_egl_create_surface(
 	EGLBoolean ret = EGL_FALSE;
 	EGLSurface surface = EGL_NO_SURFACE;
 	EGLint n;
+
+	LOGF(
+		"layer_attribs[] = { EGL_DRM_PLANE_EXT, %ld, 0 }",
+		layer_attribs[1]);
+	LOGF("surface_attribs[] = { EGL_WIDTH, %d, EGL_HEIGHT, %d, 0 }",
+		 surface_attribs[1], surface_attribs[3]);
+	
 	 /* Find the EGLOutputLayer that corresponds to the DRM KMS plane. */
 	ret = nvidia->eglGetOutputLayers(
 		egl_display, layer_attribs, &egl_layer, 1, &n);
@@ -1289,8 +1292,7 @@ static EGLBoolean nvidia_egl_create_surface(
 	}
 
 	/* Create an EGLStream. */
-	egl_stream = nvidia->eglCreateStream(
-		egl_display, stream_attribs);
+	egl_stream = nvidia->eglCreateStream(egl_display, stream_attribs);
 
 	if (egl_stream == EGL_NO_STREAM_KHR) {
 		LOG_EGL_ERROR("Unable to create stream.\n");
@@ -1412,7 +1414,7 @@ static int egl_prepare_opengl_context(
 
 	context = eglCreateContext(display, config,
 		EGL_NO_CONTEXT, context_attribs);
-	if (context == NULL) {
+	if (context == EGL_NO_CONTEXT) {
 		LOG_EGL_ERROR(
 			"Failed to create an OpenGL ES 2.x context\n");
 		goto no_egl_context;
@@ -1457,15 +1459,8 @@ no_egl_display:
 static void draw(uint32_t i)
 {
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	printf("glClear -> %d\n", glGetError());
 	glClearColor(0.2f, 0.3f, 0.5f, 1.0f);
-}
-
-
-static void page_flip_handler(int fd, unsigned int frame,
-		  unsigned int sec, unsigned int usec, void *data)
-{
-	int *waiting_for_flip = data;
-	*waiting_for_flip = 0;
 }
 
 int egl_check_extensions_client(void)
@@ -1614,19 +1609,28 @@ out:
 	return ret;
 }
 
+static void dump_buffer_to_file(
+	uint8_t const * __restrict const buffer, size_t const buffer_size)
+{
+	int file = open("pixel_dump", O_WRONLY|O_CREAT, 0644);
+	if (file > 0) {
+		write(file, buffer, buffer_size);
+		close(file);
+	}
+	else {
+		LOG_ERROR(
+			"Could not open pixel_dump for writing : %d\n", file);
+	}
+}
+
 int main(int argc, char *argv[])
 {
-	fd_set fds;
-	drmEventContext evctx = {
-		.version = DRM_EVENT_CONTEXT_VERSION,
-		.page_flip_handler = page_flip_handler,
-	};
-	struct drm_fb *fb;
 	uint32_t i = 0;
 	int ret;
-	struct myy_nvidia_functions myy_nvidia;
-	myy_drm_infos_t drm;
-	myy_opengl_infos_t gl;
+	struct myy_nvidia_functions myy_nvidia = {0};
+	myy_drm_infos_t drm = {0};
+	myy_opengl_infos_t gl = {0};
+	uint8_t * __restrict pixel_pweep;
 
 	ret = myy_nvidia_functions_prepare(&myy_nvidia);
 	if (ret) {
@@ -1678,6 +1682,13 @@ int main(int argc, char *argv[])
 		return ret;
 	}
 
+	
+	pixel_pweep = (uint8_t *) malloc(1920*1080*4);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glClearColor(0.2f, 0.5f, 0.8f, 1.0f);
+	eglSwapBuffers(gl.display, gl.surface);
+	glReadPixels(0, 0, 1920, 1080, GL_RGBA, GL_BYTE, pixel_pweep);
+	dump_buffer_to_file(pixel_pweep, 1920*1080*4);
 	while (1) {
 		draw(i++);
 		if (!eglSwapBuffers(gl.display, gl.surface)) {
