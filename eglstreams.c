@@ -37,8 +37,11 @@
 #include <stdbool.h> // bool
 #include <unistd.h>  // close
 
+#include <sys/mman.h> // mmap
+
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <libdrm/drm_mode.h> // DRM_MODE_XXX
 
 #define GL_GLEXT_PROTOTYPES 1
 #include <GLES2/gl2.h>
@@ -73,14 +76,13 @@ typedef struct myy_opengl_infos myy_opengl_infos_t;
 
 struct myy_drm_infos {
 	int fd;
-	drmModeModeInfo * mode;
+	drmModeModeInfo mode;
 	uint32_t crtc_id;
 	uint32_t plane_id;
 	uint32_t connector_id;
 	uint32_t width;
 	uint32_t height;
 	uint32_t framebuffer_id;
-	uint32_t mode_blob_id;
 	uint8_t * __restrict framebuffer;
 };
 typedef struct myy_drm_infos myy_drm_infos_t;
@@ -105,20 +107,24 @@ struct myy_drm_caps {
 	int const cap_arg;
 };
 
-static void myy_drm_config_print(
+static void myy_drm_config_dump(
 	myy_drm_infos_t * __restrict const myy_drm_conf)
 {
 	LOGF("[Current DRM config]\n"
-		"\tfd           = %d\n"
-		"\tmode         = %p\n"
-		"\tcrtc_id      = %u\n"
-		"\tplane_id     = %u\n"
-		"\tconnector_id = %u\n",
+		"\tfd             = %d\n"
+		"\tcrtc_id        = %u\n"
+		"\tplane_id       = %u\n"
+		"\tconnector_id   = %u\n"
+		"\twidth          = %d\n"
+		"\theight         = %d\n"
+		"\tframebuffer_id = %d\n",
 		myy_drm_conf->fd          ,
-		myy_drm_conf->mode        ,
 		myy_drm_conf->crtc_id     ,
 		myy_drm_conf->plane_id    ,
-		myy_drm_conf->connector_id);
+		myy_drm_conf->connector_id,
+		myy_drm_conf->width,
+		myy_drm_conf->height,
+		myy_drm_conf->framebuffer_id);
 }
 
 /* Ugh... yeah... How about eglCheckForExtension("name", TYPE) ?
@@ -268,7 +274,6 @@ static uint32_t drm_encoder_find_crtc(
 	drmModeEncoder const * __restrict const encoder,
 	uint32_t * __restrict const crtc_index)
 {
-	LOGF("Find encoder CRTC");
 	/* 0 for "no CRTC found" */
 	uint32_t selected_crtc = NO_CRTC_FOUND;
 	uint32_t const n_crtcs = resources->count_crtcs;
@@ -282,11 +287,6 @@ static uint32_t drm_encoder_find_crtc(
 		uint32_t const crtc_mask = 1 << i;
 		uint32_t const possible_crtcs =
 			encoder->possible_crtcs;
-		LOGF(
-			"CRTCS : %08x\n"
-			"MASK  : %08x\n",
-			crtc_mask,
-			possible_crtcs);
 		if (possible_crtcs & crtc_mask) {
 			selected_crtc = resources->crtcs[i];
 			*crtc_index = i;
@@ -363,7 +363,7 @@ static void drm_mode_display_infos(
 		mode->vrefresh   ,
 		mode->flags      ,
 		mode->type       ,
-		mode->name ? mode->name : "(null)");
+		mode->name);
 }
 
 static bool drm_connector_seems_valid(
@@ -460,12 +460,16 @@ static int myy_drm_set_caps(
 		if (drmSetClientCap(drm_fd, caps->cap_code, caps->cap_arg)
 		    != 0)
 		{
-			LOGF("Could not set property %s.\n", caps->name);
+			LOG_ERROR("Could not set property %s.\n", caps->name);
 			ret = -1;
 			/* Keep going, enumerate all issues and provide
 			 * meaningful error messages.
 			 * Then fail at the end.
 			 */
+		}
+		else {
+			LOGF("%s (%d) = %d -> 0\n",
+				 caps->name, caps->cap_code, caps->cap_arg);
 		}
 		caps++;
 	}
@@ -542,7 +546,6 @@ static uint32_t drm_get_primary_plane_for_crtc(
 	uint32_t const selected_crtc_index)
 {
 	uint32_t plane_id = NO_PLANE_FOUND;
-	uint32_t n_planes = 0;
 	drmModePlaneRes * __restrict const planes_resources =
 		drmModeGetPlaneResources(drm_fd);
 
@@ -604,7 +607,8 @@ static int drm_init(
 	drmModeModeInfo * mode = NULL;
 	struct myy_drm_caps const requested_caps[] = {
 		{
-			"DRM_CLIENT_CAP_UNIVERSAL_PLANES", DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+			"DRM_CLIENT_CAP_UNIVERSAL_PLANES",
+			DRM_CLIENT_CAP_UNIVERSAL_PLANES,
 			1
 		},
 		{
@@ -616,7 +620,6 @@ static int drm_init(
 			(char const *) 0, 0, 0
 		}
 	};
-	int i, area;
 	int drm_fd = -1;
 	int ret = -1;
 	uint32_t crtc_index = 0;
@@ -673,7 +676,7 @@ static int drm_init(
 	drmModeFreeResources(resources);
 
 	myy_drm_conf->fd           = drm_fd;
-	myy_drm_conf->mode         = mode;
+	myy_drm_conf->mode         = *mode;
 	myy_drm_conf->crtc_id      = crtc_id;
 	myy_drm_conf->plane_id     = plane_id;
 	myy_drm_conf->connector_id = connector->connector_id;
@@ -700,8 +703,9 @@ static uint32_t drm_create_mode_id(
 	myy_drm_infos_t * __restrict const myy_drm_conf)
 {
 	uint32_t mode_id = 0;
+
 	int const ret = drmModeCreatePropertyBlob(
-		myy_drm_conf->drm_fd,
+		myy_drm_conf->fd,
 		&myy_drm_conf->mode,
 		sizeof(myy_drm_conf->mode),
 		&mode_id);
@@ -713,7 +717,7 @@ static uint32_t drm_create_mode_id(
 	}
 	return mode_id;
 }
-static int drm_map_framebuffer(
+static bool drm_map_framebuffer(
 	myy_drm_infos_t * __restrict const myy_drm_conf)
 {
 	struct drm_mode_create_dumb dumb_create_req = { 0 };
@@ -725,7 +729,7 @@ static int drm_map_framebuffer(
 	 * Got zero idea.
 	 * But without it, nothing works.
 	 */
-	uint8_t * __restrict const framebuffer;
+	uint8_t * __restrict framebuffer;
 
 	uint32_t fb = 0;
 	int ret;
@@ -775,40 +779,367 @@ static int drm_map_framebuffer(
 
 	myy_drm_conf->framebuffer_id = fb;
 	myy_drm_conf->framebuffer    = framebuffer;
-	return 0;
+	return true;
 
 /* TODO Unmap framebuffer ? */
 could_not_mmap_frame_buffer:
 /* TODO Unmap dumb buffer ! */
 could_not_map_dumb_buffer:
 /* TODO Remove FB */
-no_frame_buffer;
+no_frame_buffer:
 /* TODO Destroy dumb buffer ! */
 create_dumb_buffer_failed:
-	return -1;
+	return false;
 	
 }
 
-static void drm_make_atomic(
+struct myy_kms_prop_id {
+	char const * __restrict const name;
+	uint32_t * __restrict const id;
+};
+
+static bool myy_drm_kms_get_prop_ids(
+	int const drm_fd,
+	uint32_t const object_id,
+	uint32_t const object_type,
+	struct myy_kms_prop_id const * __restrict const myy_props,
+	size_t const n_props)
+{
+	drmModeObjectProperties * __restrict const drm_mode_props =
+		drmModeObjectGetProperties(drm_fd, object_id, object_type);
+	bool all_props_found = true;
+
+	if (drm_mode_props == NULL) {
+		LOG_ERROR(
+			"drmModeObjectGetProperties returned NULL for I: %d, T: %d",
+			 object_id, object_type);
+		goto no_props;
+	}
+
+	for (uint32_t i = 0; i < drm_mode_props->count_props; i++) {
+		drmModePropertyRes * __restrict const prop =
+			drmModeGetProperty(drm_fd, drm_mode_props->props[i]);
+		if (prop == NULL) {
+			LOG_ERROR("The DRM driver is listing NULL properties...");
+			goto invalid_prop;
+		}
+
+		for (uint32_t m = 0; m < n_props; m++) {
+			struct myy_kms_prop_id looked_up_prop = myy_props[m];
+			/* The longest property names we have are "MODE_ID" and
+			 * "CRTC_ID". So that's 8 chars, '\0' accounted. */
+			if (strncmp(looked_up_prop.name, prop->name, 8) == 0)
+			{
+				
+				*looked_up_prop.id = prop->prop_id;
+				LOGF("Property ID %s = %d\n",
+					 looked_up_prop.name,
+					 prop->prop_id);
+				break;
+			}
+		}
+
+		drmModeFreeProperty(prop);
+	}
+
+	/* NOTE: This assumes that properties were initialized to 0
+	 * before calling this function.
+	 */
+	for (uint32_t m = 0; m < n_props; m++) {
+		uint32_t const id_val = *(myy_props[m].id);
+		bool const prop_found = ( id_val != 0 );
+		if (!prop_found) {
+			LOG_ERROR("Property %s was not found", myy_props[m].name);
+		}
+		all_props_found &= prop_found;
+	}
+
+	if (!all_props_found)
+		goto not_all_props;
+
+	return true;
+
+invalid_prop:
+	drmModeFreeObjectProperties(drm_mode_props);
+not_all_props:
+no_props:
+	return false;
+}
+
+struct myy_drm_atomic_props_ids {
+	struct {
+		uint32_t mode_id;
+		uint32_t active;
+	} crtc;
+	struct {
+		uint32_t crtc_id;
+	} connector;
+	struct {
+		uint32_t src_x;
+		uint32_t src_y;
+		uint32_t src_w;
+		uint32_t src_h;
+		uint32_t crtc_x;
+		uint32_t crtc_y;
+		uint32_t crtc_w;
+		uint32_t crtc_h;
+		uint32_t fb_id;
+		uint32_t crtc_id;
+	} plane;
+};
+
+static void myy_drm_atomic_props_ids_dump(
+	struct myy_drm_atomic_props_ids * __restrict const ids)
+{
+	LOGF(
+		"[myy_drm_atomic_props_ids]\n"
+		"\tcrtc.mode_id      = %d\n"
+		"\tcrtc.active       = %d\n"
+		"\tconnector.crtc_id = %d\n"
+		"\tplane.src_x       = %d\n"
+		"\tplane.src_y       = %d\n"
+		"\tplane.src_w       = %d\n"
+		"\tplane.src_h       = %d\n"
+		"\tplane.crtc_x      = %d\n"
+		"\tplane.crtc_y      = %d\n"
+		"\tplane.crtc_w      = %d\n"
+		"\tplane.crtc_h      = %d\n"
+		"\tplane.fb_id       = %d\n"
+		"\tplane.crtc_id     = %d\n",
+		ids->crtc.mode_id     ,
+		ids->crtc.active      ,
+		ids->connector.crtc_id,
+		ids->plane.src_x      ,
+		ids->plane.src_y      ,
+		ids->plane.src_w      ,
+		ids->plane.src_h      ,
+		ids->plane.crtc_x     ,
+		ids->plane.crtc_y     ,
+		ids->plane.crtc_w     ,
+		ids->plane.crtc_h     ,
+		ids->plane.fb_id      ,
+		ids->plane.crtc_id);
+}
+
+static bool myy_drm_atomic_get_props_ids(
+	int const drm_fd,
 	myy_drm_infos_t const * __restrict const myy_drm_conf,
-	drmModeAtomicReq * __restrict const atomic_request,
+	struct myy_drm_atomic_props_ids * __restrict const prop_ids)
+{
+	struct myy_kms_prop_id const crtc_props[] = {
+		{ "MODE_ID", &prop_ids->crtc.mode_id      },
+		{ "ACTIVE",  &prop_ids->crtc.active       },
+	};
+
+	struct myy_kms_prop_id const connector_props[] = {
+		{ "CRTC_ID", &prop_ids->connector.crtc_id },
+	};
+
+	struct myy_kms_prop_id const plane_props[] = {
+		{ "SRC_X",   &prop_ids->plane.src_x       },
+		{ "SRC_Y",   &prop_ids->plane.src_y       },
+		{ "SRC_W",   &prop_ids->plane.src_w       },
+		{ "SRC_H",   &prop_ids->plane.src_h       },
+		{ "CRTC_X",  &prop_ids->plane.crtc_x      },
+		{ "CRTC_Y",  &prop_ids->plane.crtc_y      },
+		{ "CRTC_W",  &prop_ids->plane.crtc_w      },
+		{ "CRTC_H",  &prop_ids->plane.crtc_h      },
+		{ "FB_ID",   &prop_ids->plane.fb_id       },
+		{ "CRTC_ID", &prop_ids->plane.crtc_id     },
+	};
+
+	return (
+		myy_drm_kms_get_prop_ids(
+			drm_fd, myy_drm_conf->crtc_id,
+			DRM_MODE_OBJECT_CRTC,
+			crtc_props, ARRAY_SIZE(crtc_props))
+		&& myy_drm_kms_get_prop_ids(
+			drm_fd, myy_drm_conf->connector_id,
+			DRM_MODE_OBJECT_CONNECTOR,
+			connector_props, ARRAY_SIZE(connector_props))
+		&& myy_drm_kms_get_prop_ids(
+			drm_fd, myy_drm_conf->plane_id,
+			DRM_MODE_OBJECT_PLANE,
+			plane_props, ARRAY_SIZE(plane_props))
+	);
+}
+
+#define myy_set_atomic_add_prop(request, element_id, prop_id, prop_val) \
+	{\
+		LOGF("drmModeAtomicAddProperty(\n"\
+			"\t" #request    " : %p,\n"\
+			"\t" #element_id " : %u,\n"\
+			"\t" #prop_id    " : %u,\n"\
+			"\t" #prop_val   " : %u);\n",\
+			request, element_id, prop_id, prop_val); \
+		int const ret_val = drmModeAtomicAddProperty(\
+			request, element_id, prop_id, prop_val); \
+		LOGF("-> %d", ret_val);\
+	}
+
+
+static bool drm_setup_atomic_mode_for_streams(
+	myy_drm_infos_t const * __restrict const myy_drm_conf,
 	uint32_t const mode_blob_id)
 {
-	int const drm_fd =
-		myy_drm_conf->fd;
-	uint32_t const width =
-		myy_drm_conf->width;
-	uint32_t const height =
-		myy_drm_conf->height;
-	uint32_t const mode_blob_id =
-		myy_drm_conf->mode_blob_id;
-	uint32_t const framebuffer_id =
-		myy_drm_conf->framebuffer_id;
+	/* Cache all the props. They will all be used, beside the
+	 * CPU framebuffer address that we allocated for... no reason ? */
+	myy_drm_infos_t const drm_conf = *myy_drm_conf;
+	
+	int const drm_fd              = drm_conf.fd;
+	bool ret;
+	int i_ret;
 
-	/* RESUME FROM HERE */
+	drmModeAtomicReq * __restrict const atomic_request =
+		drmModeAtomicAlloc();
+	struct myy_drm_atomic_props_ids props_ids = { 0 };
+
+	if (atomic_request == NULL) {
+		LOG_ERROR("NO ATOMIC REQUEST ! OH NO !");
+		goto no_atomic_request;
+	}
+
+	ret = myy_drm_atomic_get_props_ids(
+		drm_fd, myy_drm_conf, &props_ids);
+	if (ret == false) {
+		LOG_ERROR("Some required DRM properties were not found :C");
+		goto some_props_not_found;
+	}
+
+	/* TODO Some checks should be performed here */
+	/* Copying NVIDIA comments */
+	/* Myy : CRTC props */
+	{
+		/*
+		 * Specify the mode to use on the CRTC,
+		 * and make the CRTC active.
+		 */
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.crtc_id,
+			props_ids.crtc.mode_id, mode_blob_id);
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.crtc_id,
+			props_ids.crtc.active, 1);
+	}
+
+
+	/* Myy : Connector props */
+	{
+		/* Tell the connector to receive pixels from the CRTC. */
+		myy_set_atomic_add_prop(
+			atomic_request,
+			drm_conf.connector_id,
+			props_ids.connector.crtc_id,
+			drm_conf.crtc_id);
+	}
+
+	/* Myy : Plane props */
+	{
+		/* 
+		 * Specify the region of source surface to display (i.e., the
+		 * "ViewPortIn").  Note these values are in 16.16 format, so
+		 * shift up by 16.
+		 */
+
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.plane_id,
+			props_ids.plane.src_x, 0);
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.plane_id,
+			props_ids.plane.src_y, 0);
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.plane_id,
+			props_ids.plane.src_w, drm_conf.width << 16);
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.plane_id,
+			props_ids.plane.src_h, drm_conf.height << 16);
+
+		/* 
+		 * Specify the region within the mode where the image should be
+		 * displayed (i.e., the "ViewPortOut").
+		 */
+
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.plane_id,
+			props_ids.plane.crtc_x, 0);
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.plane_id,
+			props_ids.plane.crtc_y, 0);
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.plane_id,
+			props_ids.plane.crtc_w, drm_conf.width);
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.plane_id,
+			props_ids.plane.crtc_h, drm_conf.height);
+
+		/*
+		 * Specify the surface to display in the plane, and connect the
+		 * plane to the CRTC.
+		 *
+		 * XXX for EGLStreams purposes, it would be nice to have the
+		 * option of not specifying a surface at this point, as well as
+		 * to be able to have the KMS atomic modeset consume a frame
+		 * from an EGLStream.
+		 */
+
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.plane_id,
+			props_ids.plane.fb_id, drm_conf.framebuffer_id);
+		myy_set_atomic_add_prop(
+			atomic_request, drm_conf.plane_id,
+			props_ids.plane.crtc_id, drm_conf.crtc_id);
+	}
+
+	i_ret = drmModeAtomicCommit(
+		drm_fd, atomic_request,
+		DRM_MODE_ATOMIC_ALLOW_MODESET,
+		NULL);
+	if (i_ret != 0) {
+		LOGF("Oh, the NVIDIA driver failed for no fucking reason ! %d\n",
+			i_ret);
+		goto could_not_commit;
+	}
+
+	drmModeAtomicFree(atomic_request);
+	return true;
+
+could_not_commit:
+some_props_not_found:
+	drmModeAtomicFree(atomic_request);
+no_atomic_request:
+	return false;
 }
 	
 
+static int nvidia_attach_streams_to_drm(
+	myy_drm_infos_t * __restrict const myy_drm_conf)
+{
+	uint32_t const mode_blob_id =
+		drm_create_mode_id(myy_drm_conf);
+	if (mode_blob_id == 0) {
+		goto no_mode_blob_id;
+	}
+
+	if (!drm_map_framebuffer(myy_drm_conf)) {
+		LOG_ERROR("Could not map frame_buffer");
+		goto could_not_map_framebuffer;
+	}
+
+	if (!drm_setup_atomic_mode_for_streams(myy_drm_conf, mode_blob_id))
+	{
+		LOG_ERROR(
+			"Could not setup DRM Atomic mode for NVIDIA EGLStreams");
+		goto could_not_setup_atomic_mode_for_streams;
+	}
+
+	return 0;
+
+could_not_setup_atomic_mode_for_streams:
+/* TODO Unmap framebuffer */
+could_not_map_framebuffer:
+no_mode_blob_id:
+	return -1;
+}
 static int nvidia_drm_open(
 	struct myy_nvidia_functions const * __restrict const myy_nvidia,
 	EGLDeviceEXT egl_device,
@@ -829,10 +1160,31 @@ static int nvidia_drm_open(
 		LOGF("We tried to use a device which doesn't seem to have "
 		"an actual DRM device filepath (e.g. : /dev/dri/card0)\n");
 		ret = -1;
+		goto no_drm_device_filepath;
 	}
 
 	ret = drm_init(drm_device_filepath, myy_drm_conf);
+	if (ret == -1) {
+		LOG_ERROR(
+			"Could not initialize the whole drm subsystem");
+		goto could_not_initialise_drm;
+	}
+
+	ret = nvidia_attach_streams_to_drm(myy_drm_conf);
+	if (ret == -1) {
+		LOG_ERROR(
+			"Could not connect NVIDIA EGL Streams to the DRM "
+			"subsystem");
+		goto could_not_attach_streams_to_kms;
+	}
+
 	return ret;
+
+could_not_attach_streams_to_kms:
+/* TODO drm_deinit */
+could_not_initialise_drm:
+no_drm_device_filepath:
+	return -1;
 }
 
 
@@ -1015,9 +1367,7 @@ static int egl_prepare_opengl_context(
 	myy_drm_infos_t * __restrict const myy_drm_conf,
 	myy_opengl_infos_t * __restrict const myy_gl_conf)
 {
-	EGLint major, minor, n;
-	GLuint vertex_shader, fragment_shader;
-	GLint ret;
+	EGLint major, minor;
 	EGLBoolean egl_ret = EGL_FALSE;
 	EGLDisplay display;
 	EGLConfig config;
@@ -1106,7 +1456,7 @@ no_egl_display:
 /* Draw code here */
 static void draw(uint32_t i)
 {
-	glClear(GL_COLOR_BUFFER_BIT);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 	glClearColor(0.2f, 0.3f, 0.5f, 1.0f);
 }
 
@@ -1317,7 +1667,7 @@ int main(int argc, char *argv[])
 			"Failed to initialize DRM through NVIDIA means");
 		return ret;
 	}
-	myy_drm_config_print(&drm);
+	myy_drm_config_dump(&drm);
 
 
 	ret = egl_prepare_opengl_context(
@@ -1330,7 +1680,11 @@ int main(int argc, char *argv[])
 
 	while (1) {
 		draw(i++);
-		eglSwapBuffers(gl.display, gl.surface);
+		if (!eglSwapBuffers(gl.display, gl.surface)) {
+			LOG_ERROR(
+				"Could not swap the buffers !? CALL THE POLICE !\n"
+				"Error : %d", eglGetError());
+		}
 	}
 
 	return ret;
